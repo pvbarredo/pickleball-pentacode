@@ -1,0 +1,18 @@
+# BoT-SORT tuned for a fixed-camera pickleball court: fewer players, longer
+# occlusions near the net, and background spectators that shouldn't spawn
+# brand-new IDs as easily as real players.
+
+tracker_type: botsort
+track_high_thresh: 0.5      # stricter first-stage match -> less noisy association
+track_low_thresh: 0.1
+new_track_thresh: 0.6       # higher bar to spawn a new ID (cuts spurious re-IDs)
+track_buffer: 150           # keep lost tracks alive ~5s @ 30fps through occlusion
+match_thresh: 0.8
+fuse_score: True
+
+gmc_method: none            # static camera, no motion compensation needed
+
+proximity_thresh: 0.5
+appearance_thresh: 0.25     # looser appearance gate so re-ID can re-link after longer gaps
+with_reid: True
+model: auto                 # reuse YOLO backbone features, no extra model download

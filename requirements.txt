@@ -1,0 +1,6 @@
+# torch / torchvision are installed separately with a CUDA-matched index URL
+# (see README "Setup on a new PC") -- pip alone would give you the CPU build.
+ultralytics
+opencv-python
+scipy
+Pillow
