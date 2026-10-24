@@ -120,6 +120,137 @@ names. The workflow:
 4. **`src/main.py --seed-gallery output/enroll/gallery_named.json`** — the
    full run, now starting with your named players already in the gallery.
 
+## Court lines, kitchen/service zones, ball tracking, and the minimap
+
+A separate feature set overlays the court geometry itself (lines, the net,
+the kitchen/service-box zones) and tracks the ball. None of this touches
+detection/tracking/re-ID above — it's purely visual/geometric.
+
+### Why calibration is fully manual, not auto-detected
+
+The first attempt detected lines automatically (HSV threshold for painted
+white lines → Canny edges → `cv2.HoughLinesP` → cluster nearby segments into
+one line per real edge). It worked, but this camera's visible lens
+distortion (the baseline is visibly curved, not straight) kept breaking two
+things that needed to be reliable:
+
+- A 4-corner homography (click/detect the net posts + baseline corners,
+  derive every other line by projecting known court dimensions through the
+  resulting perspective transform) assumes straight lines. A tiny angle
+  error in a short detected segment, extrapolated across hundreds of pixels
+  *and* real lens distortion, threw the far end off by 150px+.
+- The camera doesn't necessarily frame the whole court (a line can run off
+  the edge of frame, or behind equipment) — an algorithm that always
+  produces 4 corners can't represent "this line isn't visible here."
+
+So calibration ([`src/court_calibration_ui.py`](src/court_calibration_ui.py))
+is fully manual instead, and nothing is derived or extrapolated between
+parts — every part you skip is simply absent, never guessed:
+
+1. **Person-free background plate** ([`src/background_plate.py`](src/background_plate.py)):
+   the per-pixel **median** across ~40 frames spread across the video. The
+   camera is fixed, so the court is identical in every frame, but any given
+   pixel is only covered by a moving player some of the time — across
+   enough samples the median at each pixel is the real court surface, not a
+   person. (Deliberately not generative AI: real frames already show every
+   part of the court unoccluded at some point, so this is both more
+   accurate — no hallucinated detail — and instant/free.)
+
+2. **Click-trace each court part** on that background image, one at a time,
+   with a side panel showing a schematic (which part is meant) and a
+   zoomed-in hint crop (roughly where, in this specific photo) for each
+   step:
+   - The **5 lines** (near/far baseline, both sidelines, both kitchen
+     lines, both center lines — 10 total across both halves) are each a
+     **polyline**: click as many points as needed to follow the curve, then
+     "Finish this line". A straight 2-point line cuts the corner on a
+     curved one.
+   - The **net** is a **4-corner polygon** (top-left, top-right,
+     bottom-right, bottom-left of its visible face) — it has real height in
+     the image, not just a top cable.
+   - **"Skip this line"** on anything not visible in this camera's framing
+     (e.g. the far baseline, often hidden behind equipment).
+   - **"Redo a specific part"** re-traces just one already-finished part in
+     place, without touching anything traced before or after it.
+   - The window scales to fit the screen (capped at 1080p, never upscaled)
+     and converts clicks back to the source image's own coordinate space,
+     so calibration stays pixel-accurate regardless of display scaling.
+   - Re-running the tool **resumes** your saved calibration instead of
+     making you re-trace everything.
+
+   Saves `output/calibration/picklecam_vertical.json`: each part's traced
+   points, or `null` if skipped.
+
+3. **`src/court_lines.py`** loads that file and expands each polyline/polygon
+   into the flat list of straight segments `draw_court_overlay()` draws —
+   no detection or derivation at video-processing time, just what you
+   traced.
+
+Calibration is **camera-specific** (what's hand-clicked: the polygon that
+restricts detection in `src/court_roi.py`, the net's fallback position in
+`src/court_profiles.py`), kept isolated from the **generic** algorithm code
+(`src/court_lines.py`'s clustering/drawing math), so a different camera
+angle — e.g. one looking across the court's *width* instead of down its
+*length* — just needs a new `CourtProfile` and a fresh calibration JSON, no
+logic changes. `src/court_lines_preview.py` is a leftover diagnostic from
+the earlier auto-detection attempt (renders a top-down reconstruction to
+sanity-check geometry); not part of the normal workflow anymore.
+
+### Kitchen and service-box zones
+
+Rather than re-clicking more rectangles, the 2 kitchen zones and 4
+service-box zones are **built automatically from the lines you already
+traced** (`_build_kitchen_zone` / `_build_service_zones` in
+`src/court_lines.py`) — connecting real traced points, never inventing new
+geometry:
+
+- **Kitchen zone**: the net's own base (where it meets the floor — *not*
+  its top cable; that's elevated by the net's height and irrelevant to a
+  floor-level zone) on one side, the kitchen line's traced curve on the
+  other. The left/right edges use the **actual merge point**: wherever that
+  sideline's own traced curve comes closest to the net's base line — not
+  the net polygon's literal clicked corner, which may not land exactly on
+  the true sideline and left a visible gap/seam near the posts.
+- **Service boxes**: closed from the kitchen line + baseline + center line
+  + the relevant sideline, split left/right at the center line.
+
+Both zones always show a **colored shade** (`src/minimap.py`'s
+`shade_zones()`), baked into the actual output video — not mouse-dependent,
+so it's there whether or not `--show` is used.
+
+### Ball tracking
+
+[`src/ball_tracker.py`](src/ball_tracker.py) detects the pickleball (COCO
+`sports ball`, class 32) and draws a fading, dashed trail of its recent
+flight. Two things this needed that the person-detection pass doesn't:
+
+- **A separate, higher-resolution inference pass.** The ball is too small
+  for YOLO's default 640px inference size — it was invisible in testing.
+  `--ball-imgsz` (default `1280`) fixes that, at real extra cost (another
+  full forward pass, at ~4x the pixel area of the person pass).
+- **Its own model instance.** `model` is mid-iteration through its own
+  `track(stream=True)` generator; calling `predict()` on that *same* object
+  for the ball pass corrupted its internal state and hung the whole
+  process. The ball model is always a second, independent `YOLO(...)`.
+
+The trail only connects two detections if they're within `--max-gap`-ish
+consecutive frames of each other (hardcoded ~0.2s) — otherwise it starts a
+new disconnected stroke rather than drawing a false "bridge" line across a
+gap where the ball wasn't detected (briefly occluded, or genuinely a new
+flight).
+
+### The minimap (hover-highlight)
+
+In the live `--show` window only, a small panel (top-right) shows every
+zone in miniature; hovering a zone there brightens that same zone on the
+main video (`src/minimap.py`'s `Minimap` class, `hover_boost()` +
+`draw()`). This is strictly mouse-dependent and only makes sense
+interactively — never baked into a written file. If hovering doesn't seem
+to register, a small red crosshair (`draw_mouse_debug()`) shows exactly
+where the app thinks your mouse is; if it doesn't track your real cursor,
+that's a coordinate-scaling mismatch with the raw OpenCV window (seen on
+Windows with display scaling), not a logic bug.
+
 ## Quick start
 
 ```bash
@@ -140,6 +271,18 @@ python -m src.main --input picklecam.mp4 --output output/tracked.mp4 \
 Press `q` in the preview window to stop early (whatever was processed so
 far is still saved to `--output`).
 
+To also get court lines, kitchen/service zones, and the ball trail:
+
+```bash
+# One-time: generate the background plate, then click-trace the court
+python -m src.background_plate
+python -m src.court_calibration_ui
+
+# Then any src.main run with --detect-lines picks up output/calibration/picklecam_vertical.json automatically
+python -m src.main --input picklecam.mp4 --output output/tracked.mp4 \
+  --show --detect-lines --track-ball
+```
+
 ### Useful flags on `src.main`
 
 | Flag | Default | What it does |
@@ -153,6 +296,11 @@ far is still saved to `--output`).
 | `--confirm-seconds` | `1.0` | How long a new track gets to match an existing name before becoming a new one |
 | `--tracker <path>` | `src/trackers/botsort_pickleball.yaml` | Tracker config |
 | `--max-frames N` | none | Stop after N frames (quick tests) |
+| `--detect-lines` | off | Overlay court lines + kitchen/service zone shading (see calibration section above) |
+| `--court-calibration <path>` | `output/calibration/picklecam_vertical.json` | Calibration JSON from `src.court_calibration_ui` |
+| `--court-profile` | `picklecam_vertical` | Camera-angle profile (see `src/court_profiles.py`) |
+| `--track-ball` | off | Detect the ball and draw its fading trail |
+| `--ball-conf` | `0.3` | Min confidence for a ball detection |
 
 ## Requirements
 
@@ -173,8 +321,8 @@ far is still saved to `--output`).
 | [`torch`](https://pytorch.org/) / `torchvision` | Model inference backend (GPU acceleration) |
 | [`opencv-python`](https://pypi.org/project/opencv-python/) | Video I/O, drawing, HSV color histograms for re-ID |
 | [`scipy`](https://pypi.org/project/scipy/) | Linear assignment solver (see `lap` note below) |
-| [`Pillow`](https://pypi.org/project/Pillow/) | GIF encoding, thumbnails in the naming window |
-| `tkinter` (stdlib) | The visual naming window |
+| [`Pillow`](https://pypi.org/project/Pillow/) | GIF encoding, thumbnails in the naming/calibration windows |
+| `tkinter` (stdlib) | The visual naming and court-calibration windows |
 | `numpy` | Everywhere (pulled in by the above) |
 
 ### How the GPU is used
@@ -232,19 +380,26 @@ remove it.
 
 ```
 src/
-  main.py            Full run: detect + track + re-ID + (optional) pose, writes output video
-  enroll.py           Fast full-video scan: collects named-candidate photos/GIFs
-  label_ui.py          Tkinter window for visually naming enrollment candidates
-  apply_naming.py       Merges your naming choices into the final seed gallery
-  reid_gallery.py        Persistent multi-exemplar appearance matching
-  track_resolver.py       Delays new-track naming to retry matches per-frame
-  court_roi.py              Main-court polygon filter (camera-specific)
-  draw.py                    Box/label/skeleton drawing
-  names.py                    Random name pool for un-enrolled players
-  config.py                    CLI defaults
-  lap_shim.py                   Windows DLL-block workaround (see above)
-  trackers/botsort_pickleball.yaml   Tuned BoT-SORT config
-output/                  Generated videos, enrollment photos/GIFs, galleries (gitignored)
+  main.py                  Full run: detect + track + re-ID + (optional) pose/lines/ball, writes output video
+  enroll.py                 Fast full-video scan: collects named-candidate photos/GIFs
+  label_ui.py                 Tkinter window for visually naming enrollment candidates
+  apply_naming.py                Merges your naming choices into the final seed gallery
+  reid_gallery.py                  Persistent multi-exemplar appearance matching
+  track_resolver.py                   Delays new-track naming to retry matches per-frame
+  court_roi.py                          Main-court polygon filter (player detection, camera-specific)
+  draw.py                                 Box/label/skeleton drawing
+  names.py                                  Random name pool for un-enrolled players
+  config.py                                   CLI defaults
+  lap_shim.py                                   Windows DLL-block workaround (see above)
+  trackers/botsort_pickleball.yaml                Tuned BoT-SORT config
+  background_plate.py      Person-free court photo via median-of-frames
+  court_calibration_ui.py   Tkinter window: click-trace every court line + the net
+  court_profiles.py          Per-camera-angle calibration (net fallback position, search ROI)
+  court_lines.py               Loads a calibration JSON; builds kitchen/service zones; draws overlay
+  court_lines_preview.py        Leftover diagnostic from the earlier auto-detection attempt
+  ball_tracker.py          Ball detection (separate higher-res model pass) + fading trail
+  minimap.py                Always-on zone shading + the live hover-highlight panel
+output/                  Generated videos, enrollment photos/GIFs, galleries, calibration JSON (gitignored)
 ```
 
 ## Known limitations
@@ -257,3 +412,10 @@ output/                  Generated videos, enrollment photos/GIFs, galleries (gi
   camera position; a different camera angle needs a new polygon (see the
   frame-0 annotated debug approach used during development — draw the
   polygon over a sample frame and adjust the four corner points).
+- Court-line calibration (`output/calibration/picklecam_vertical.json`) is
+  per-video/per-camera-position data, not committed to the repo (it's under
+  the gitignored `output/`) — a new video needs its own
+  `src.background_plate` + `src.court_calibration_ui` pass.
+- The far side of the court (beyond the net) is only as complete as what's
+  actually visible and traced — far-baseline is commonly skipped where
+  equipment/staging blocks the camera's view of it.

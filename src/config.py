@@ -19,3 +19,9 @@ class Config:
     seed_gallery: str | None = None
     confirm_seconds: float = 1.0
     match_thresh: float = 0.75
+    detect_lines: bool = False
+    court_profile: str = "picklecam_vertical"
+    court_calibration: str | None = "output/calibration/picklecam_vertical.json"
+    track_ball: bool = False
+    ball_conf: float = 0.3
+    ball_imgsz: int = 1280
