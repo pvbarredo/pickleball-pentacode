@@ -26,7 +26,8 @@ class BallTracker:
                  max_gap_seconds: float = 0.2, small_width: int = 480, bg_alpha: float = 0.03,
                  motion_thresh: float = 18.0, hue_range: tuple = (18, 48), sat_min: int = 70, val_min: int = 90,
                  min_blob_area: int = 2, max_blob_area: int = 250, max_aspect: float = 2.5,
-                 max_speed_px_per_sec: float = 5000.0):
+                 max_speed_px_per_sec: float = 5000.0, max_ball_box_px: float = 70.0,
+                 foot_zone_ratio: float = 0.45):
         self.conf = conf
         self.imgsz = imgsz
         self.fps = fps
@@ -38,6 +39,11 @@ class BallTracker:
         # YOLO box) that would otherwise get wired into the trail as a single
         # continuous "flight" no real ball could make.
         self.max_px_per_frame = max_speed_px_per_sec / fps
+        # A real ball's box is small and isn't sitting on someone's foot --
+        # a shoe (bright/white, roughly ball-sized) is YOLO's most common
+        # ball false-positive.
+        self.max_ball_box_px = max_ball_box_px
+        self.foot_zone_ratio = foot_zone_ratio
         self.positions = deque()  # (frame_idx, x, y)
 
         # Color+motion fallback state (see _color_motion_mask / _select_blob).
@@ -53,13 +59,22 @@ class BallTracker:
         self._bg = None
         self._last_pos = None  # (frame_idx, x, y) -- most recent hit, either source
 
-    def detect(self, model, frame, frame_idx: int):
-        """Runs the ball-only YOLO pass; if it finds nothing, falls back to a
-        color+motion blob pick before giving up on the frame entirely."""
+    def detect(self, model, frame, frame_idx: int, person_boxes=None):
+        """Runs the ball-only YOLO pass; if it finds nothing (plausible after
+        filtering out shoes and oversized boxes), falls back to a
+        color+motion blob pick before giving up on the frame entirely.
+
+        `person_boxes`: optional Nx4 xyxy array/list of this frame's person
+        boxes, used only to reject a ball box that's really someone's shoe.
+        """
         results = model.predict(frame, classes=[SPORTS_BALL_CLASS], conf=self.conf, imgsz=self.imgsz, verbose=False)[0]
         hit = None
-        if len(results.boxes):
-            best = max(results.boxes, key=lambda b: b.conf.item())
+        candidates = [
+            b for b in results.boxes
+            if self._is_plausible_ball_box(b.xyxy[0].tolist(), person_boxes)
+        ]
+        if candidates:
+            best = max(candidates, key=lambda b: b.conf.item())
             x1, y1, x2, y2 = best.xyxy[0].tolist()
             hit = ((x1 + x2) / 2, (y1 + y2) / 2)
         else:
@@ -71,6 +86,21 @@ class BallTracker:
 
         while self.positions and frame_idx - self.positions[0][0] > self.trail_frames:
             self.positions.popleft()
+
+    def _is_plausible_ball_box(self, box_xyxy, person_boxes) -> bool:
+        x1, y1, x2, y2 = box_xyxy
+        if (x2 - x1) > self.max_ball_box_px or (y2 - y1) > self.max_ball_box_px:
+            return False  # a real ball's box is small; this is something else
+        if person_boxes is None or len(person_boxes) == 0:
+            return True
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        for px1, py1, px2, py2 in person_boxes:
+            if not (px1 < cx < px2):
+                continue
+            foot_zone_top = py2 - (py2 - py1) * self.foot_zone_ratio
+            if foot_zone_top <= cy <= py2 + 40:
+                return False  # sitting on someone's foot -- almost certainly a shoe
+        return True
 
     def _is_implausible_jump(self, frame_idx: int, hit) -> bool:
         """True if `hit` is farther from the last known position than a real

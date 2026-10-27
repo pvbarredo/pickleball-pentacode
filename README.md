@@ -233,11 +233,80 @@ flight. Two things this needed that the person-detection pass doesn't:
   for the ball pass corrupted its internal state and hung the whole
   process. The ball model is always a second, independent `YOLO(...)`.
 
-The trail only connects two detections if they're within `--max-gap`-ish
-consecutive frames of each other (hardcoded ~0.2s) — otherwise it starts a
-new disconnected stroke rather than drawing a false "bridge" line across a
-gap where the ball wasn't detected (briefly occluded, or genuinely a new
-flight).
+**Filtering out YOLO's false positives.** Two cheap, specific guards reject
+a "ball" box before it's ever trusted, both before any distance/trail logic
+runs (ideas drawn from the pickleball-rally-detection project —
+[arcotn/smart-pickleball-assistant](https://github.com/arcotn/smart-pickleball-assistant)
+and a similar teleport-detection heuristic independently used by
+[vinod-polinati/pickleball-rally-detection](https://github.com/vinod-polinati/pickleball-rally-detection)):
+
+- **Oversized-box rejection** — a real ball's box is small; anything wider
+  or taller than `max_ball_box_px` (default 70px) is something else.
+- **Shoe rejection** — YOLO's single most common ball false-positive is a
+  bright/white shoe. A candidate box is dropped if its center falls in the
+  bottom ~45% ("foot zone") of any currently-tracked person's bounding box.
+  This reuses the person-tracking boxes already computed on the same frame
+  — no extra detection pass.
+
+**When YOLO finds nothing plausible on a frame** (after the filtering
+above), a background-subtraction + HSV-color fallback tries to recover the
+position instead of leaving a gap — same recipe as the
+[PickleJudge](https://github.com/frcrcfaculty-commits/PickleBall) project's
+`detector-cpu.ts`: color is never a gate on its own (a static ball-colored
+line or shirt has no motion; a moving non-ball object has the wrong color),
+only **motion AND color together** count:
+
+1. Downscale the frame (`small_width`, default 480px wide) and keep a
+   running per-pixel background luminance average (`bg += bg_alpha * (gray
+   - bg)`).
+2. `motion = |gray - bg| > motion_thresh`, `color = HSV hue/sat/val in the
+   ball's range`. `mask = motion & color`.
+3. Connected-component blob-detect the mask; reject blobs outside the
+   area/aspect-ratio range a ball could produce (same shape-sanity idea as
+   the oversized-box check above); prefer whichever remaining blob is
+   closest to the last known ball position.
+
+**Rejecting implausible jumps.** Whatever the source (YOLO or the
+color+motion fallback), a new hit is discarded if it's farther from the
+last known position than a real ball could travel in the elapsed frames
+(`max_speed_px_per_sec`, scaled by the actual frame gap) — otherwise a
+stray match (a bit of net tape, a sock) gets wired into the trail as a
+single continuous "flight" no real ball could make. This is the same
+"teleport detection" idea both reference projects above use independently,
+confirming it's the right fix for this failure mode.
+
+**Drawing only real continuity.** The trail draws a segment between two
+points **only if they're strictly consecutive detected frames** (not just
+within some gap tolerance) — connecting across *any* gap, even a small one,
+draws a false straight "teleport" line across whatever actually happened
+while the ball wasn't seen. A dropout now just leaves a gap in the trail
+instead.
+
+### Kitchen rule-violation detection
+
+[`src/violations.py`](src/violations.py) flags two things using pieces the
+project already has — no new detection model: the `--pose` skeleton's
+ankle/wrist keypoints, and the kitchen-zone polygons from calibration
+(tested with the same `cv2.pointPolygonTest` the minimap already uses).
+Needs both `--pose` and kitchen zones from `--court-calibration`; enabled
+with `--detect-violations`. Idea adapted from
+[arcotn/smart-pickleball-assistant](https://github.com/arcotn/smart-pickleball-assistant)'s
+`pose_analyzer.py`, rewired onto this project's own zones/tracking instead
+of a separate court-zone UI and DeepSORT:
+
+- **`foot_fault`** (orange box) — either ankle keypoint (COCO index 15/16)
+  falls inside a kitchen-zone polygon.
+- **`kitchen_volley`** (red box, higher severity) — a foot-fault **plus** a
+  burst of wrist-keypoint (index 9/10) movement in the last few frames
+  (`swing_thresh`), the signal that it's an actual volley, not just
+  standing at the line.
+
+**Important caveat, not a bug**: standing right at/behind the kitchen line
+is normal ready position in real play — it is *not* itself a rule
+violation. `foot_fault` alone will fire often and should be read as "near
+the line," not "faulted." Only `kitchen_volley` (foot in + swinging) is the
+real signal. A short per-track cooldown (`cooldown_frames`, default 15)
+keeps one ongoing violation from re-flagging every single frame.
 
 ### The minimap (hover-highlight)
 
@@ -301,6 +370,7 @@ python -m src.main --input picklecam.mp4 --output output/tracked.mp4 \
 | `--court-profile` | `picklecam_vertical` | Camera-angle profile (see `src/court_profiles.py`) |
 | `--track-ball` | off | Detect the ball and draw its fading trail |
 | `--ball-conf` | `0.3` | Min confidence for a ball detection |
+| `--detect-violations` | off | Flag kitchen foot-faults/volleys (needs `--pose` and kitchen zones from `--court-calibration`) |
 
 ## Requirements
 
@@ -398,6 +468,7 @@ src/
   court_lines.py               Loads a calibration JSON; builds kitchen/service zones; draws overlay
   court_lines_preview.py        Leftover diagnostic from the earlier auto-detection attempt
   ball_tracker.py          Ball detection (separate higher-res model pass) + fading trail
+  violations.py              Kitchen foot-fault/volley detection from pose + court zones
   minimap.py                Always-on zone shading + the live hover-highlight panel
 output/                  Generated videos, enrollment photos/GIFs, galleries, calibration JSON (gitignored)
 ```

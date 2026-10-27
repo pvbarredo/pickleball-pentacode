@@ -25,3 +25,4 @@ class Config:
     track_ball: bool = False
     ball_conf: float = 0.3
     ball_imgsz: int = 1280
+    detect_violations: bool = False

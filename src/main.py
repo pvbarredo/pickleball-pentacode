@@ -18,6 +18,7 @@ from src.minimap import Minimap
 from src.names import NameAssigner
 from src.reid_gallery import ReIDGallery
 from src.track_resolver import TrackResolver
+from src.violations import ViolationDetector, draw_violation
 
 
 def parse_args() -> Config:
@@ -44,6 +45,7 @@ def parse_args() -> Config:
     parser.add_argument("--court-calibration", default=cfg.court_calibration, help="Path to a calibration JSON from src.court_calibration_ui (preferred over auto-detection when given)")
     parser.add_argument("--track-ball", action="store_true", default=cfg.track_ball, help="Detect the ball and draw a fading dashed trail of its recent path")
     parser.add_argument("--ball-conf", type=float, default=cfg.ball_conf)
+    parser.add_argument("--detect-violations", action="store_true", default=cfg.detect_violations, help="Flag kitchen foot-faults/volleys from pose + court-zone calibration (requires --pose and --court-calibration)")
     args = parser.parse_args()
 
     return Config(
@@ -67,6 +69,7 @@ def parse_args() -> Config:
         court_calibration=args.court_calibration,
         track_ball=args.track_ball,
         ball_conf=args.ball_conf,
+        detect_violations=args.detect_violations,
     )
 
 
@@ -128,6 +131,17 @@ def main() -> None:
         cv2.namedWindow("Pickleball Tracking")
         cv2.setMouseCallback("Pickleball Tracking", lambda e, x, y, f, p: mouse_pos.__setitem__(0, (x, y)))
 
+    violation_detector = None
+    if cfg.detect_violations:
+        kitchen_zones = {name: pts for name, pts in zones.items() if "kitchen" in name}
+        if not cfg.pose:
+            print("--detect-violations needs --pose for ankle/wrist keypoints; skipping.")
+        elif not kitchen_zones:
+            print("--detect-violations needs kitchen zones from --court-calibration; skipping.")
+        else:
+            violation_detector = ViolationDetector(kitchen_zones)
+            print(f"Violation detection on: watching {len(kitchen_zones)} kitchen zone(s).")
+
     ball_model = None
     ball_tracker = None
     if cfg.track_ball:
@@ -161,7 +175,8 @@ def main() -> None:
             frame = minimap.shade_zones(frame)
 
         if cfg.track_ball:
-            ball_tracker.detect(ball_model, frame, frame_count)
+            person_boxes = boxes.xyxy.cpu().numpy() if boxes is not None and len(boxes) else None
+            ball_tracker.detect(ball_model, frame, frame_count, person_boxes=person_boxes)
             frame = ball_tracker.draw(frame, frame_count)
 
         if boxes is not None and boxes.id is not None:
@@ -187,6 +202,12 @@ def main() -> None:
                 kpts_xy = result.keypoints.xy.cpu().numpy()[keep]
                 kpts_conf = result.keypoints.conf.cpu().numpy()[keep]
                 frame = draw_pose(frame, kpts_xy, kpts_conf, track_ids, cfg.kpt_conf)
+
+                if violation_detector is not None:
+                    for tid, kxy, kconf, box, nm in zip(track_ids, kpts_xy, kpts_conf, xyxy, names):
+                        violation = violation_detector.update(tid, kxy, kconf, frame_count)
+                        if violation is not None:
+                            frame = draw_violation(frame, violation, box, nm)
 
         cv2.putText(
             frame, f"Frame {frame_count} | Players seen: {len(unique_ids)}",
